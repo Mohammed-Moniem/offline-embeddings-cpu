@@ -2,11 +2,13 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, basename, resolve, join } from 'node:path';
 import { modelDirectory } from './paths.mjs';
+import { MODEL_FILE_HASHES } from './model-pins.mjs';
 
 export const QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
 export const MODEL_REVISION = 'ea104dacec62c0de699686887e3f920caeb4f3e3';
 export const MODEL_ID = 'Xenova/bge-small-en-v1.5';
 export const DIMENSIONS = 384;
+export const WEIGHTS_SHA256 = '6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4';
 
 export function validateVector(vector) {
   if ((!Array.isArray(vector) && !(vector instanceof Float32Array)) || vector.length !== DIMENSIONS ||
@@ -20,10 +22,16 @@ export async function verifyModelFiles(modelDir = modelDirectory()) {
   const manifest = JSON.parse(await readFile(join(modelDir, 'manifest.json'), 'utf8'));
   if (manifest.model !== MODEL_ID || manifest.revision !== MODEL_REVISION ||
       manifest.dtype !== 'q8') throw new Error('Unrecognized model manifest. Run the pinned model preparation script.');
-  const required = ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'];
+  const required = Object.keys(MODEL_FILE_HASHES);
+  if (manifest.files.length !== required.length || new Set(manifest.files.map(file => file.path)).size !== required.length) {
+    throw new Error('Model manifest contains unexpected or duplicate assets.');
+  }
   for (const path of required) {
     const entry = manifest.files.find(file => file.path === path);
-    if (!entry || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw new Error('Model manifest is incomplete.');
+    if (!entry || entry.sha256 !== MODEL_FILE_HASHES[path]) throw new Error('Model manifest does not match the pinned assets.');
+  }
+  if (manifest.files.find(file => file.path === 'onnx/model_quantized.onnx').sha256 !== WEIGHTS_SHA256) {
+    throw new Error('Model weight hash differs from this release.');
   }
   for (const file of manifest.files) {
     if (file.path.includes('..') || file.path.startsWith('/') || file.path.includes('\\')) throw new Error('Unsafe model manifest path.');

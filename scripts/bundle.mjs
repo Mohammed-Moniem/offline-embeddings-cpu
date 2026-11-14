@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,13 @@ const pin = pins[target];
 if (!pin) throw new Error(`Unsupported build host ${target}; build each archive on its target OS.`);
 if (options['node-version'] && options['node-version'] !== '24.18.0') throw new Error('Only Node 24.18.0 has a checked-in upstream SHA-256 pin.');
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
+for (const [dependency, expectedVersion] of Object.entries(pkg.dependencies || {})) {
+  if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(expectedVersion)) throw new Error(`Direct dependency ${dependency} must have an exact version pin.`);
+  const metadata = JSON.parse(await fs.readFile(path.join(root, 'node_modules', dependency, 'package.json'), 'utf8'));
+  if (metadata.name !== dependency || metadata.version !== expectedVersion) {
+    throw new Error(`Installed dependency ${dependency} does not match expected ${expectedVersion}.`);
+  }
+}
 const output = path.resolve(options.output || path.join(root, 'dist'));
 if (output === root) throw new Error('Output must be a separate directory.');
 for (const input of ['src', 'scripts', 'test', 'docs', 'launchers', 'models', 'node_modules']) {
@@ -194,7 +201,11 @@ async function fileManifest(directory, prefix = '') {
 }
 function run(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const env = { ...process.env };
+    // A parent pwsh PSModulePath can break built-in modules in Windows PowerShell.
+    // Each PowerShell runtime should construct its own default module search path.
+    if (/(?:powershell|pwsh)\.exe$/i.test(command)) delete env.PSModulePath;
+    const child = spawn(command, args, { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
@@ -202,7 +213,10 @@ function run(command, args) {
     child.once('exit', (code) => code === 0 ? resolve(stdout) : reject(new Error(`${command} exited ${code}: ${stderr || stdout}`)));
   });
 }
-function powershell() { return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'); }
+function powershell() {
+  const modern = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
+  return existsSync(modern) ? modern : path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
 async function discoverCrt() {
   const candidates = [];
   if (process.env.VCToolsRedistDir) candidates.push(path.join(process.env.VCToolsRedistDir, 'x64', 'Microsoft.VC143.CRT'));

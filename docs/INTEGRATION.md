@@ -16,6 +16,31 @@ Search results contain `id`, `text`, `source`, `collection`, `start`, `end`, and
 
 SQLite access and model initialization have real costs. Keep a long-lived worker/process and reuse it. Avoid concurrent writes to the same database from multiple application components. Close it during shutdown. For a Rust-owned application, the bundled executable can be invoked as a child process without adding Python or a local HTTP service.
 
+Await each document's `index()` operation before removing or replacing it. Removal is rejected while indexing is pending, so an in-flight embedding operation cannot silently recreate a document after deletion.
+
+## Embeddings only, with your existing RAG storage
+
+You can use the model without adopting this package's SQLite schema or retrieval API. Feed the resulting vectors into your existing RAG architecture:
+
+```js
+import { EmbeddingEngine } from './offline-embeddings-cpu/src/index.mjs';
+
+const engine = await EmbeddingEngine.create({ threads: 2 });
+try {
+  const text = 'Employees request annual leave through the HR portal.';
+  const chunks = engine.chunk(text);
+  const vectors = await engine.embedDocuments(chunks.map(chunk => chunk.text));
+  const queryVector = await engine.embedQuery('How can I book holiday?');
+  // Store each chunk and its matching vector in your own index.
+  // Use queryVector to search vectors created by the same engine identity.
+  console.log({ chunks, vectors, queryVector, identity: engine.identity });
+} finally {
+  await engine.close();
+}
+```
+
+`embedQuery()` applies the BGE query instruction; do not add it yourself. `embedDocuments()` takes unprefixed passage text. Persist the engine's `identity` alongside your index and reject mismatched vectors. This mode still uses the bundled local model and CPU runtime but does not open a SQLite database.
+
 ## Input contract
 
 Pass UTF-8 text extracted by your ingestion pipeline. The CLI supports text/Markdown files and directories of supported files. It does not perform OCR or parse office formats. Do not send empty or binary data as text.

@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import * as sqliteVec from 'sqlite-vec';
 import { EmbeddingEngine, validateVector } from './embedding.mjs';
+export { EmbeddingEngine };
 
 const hash = text => createHash('sha256').update(text).digest('hex');
 const encode = vector => Buffer.from(new Float32Array(validateVector(vector)).buffer);

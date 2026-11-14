@@ -72,17 +72,22 @@ try {
   const verificationFile = path.join(workspace, 'functional verification.json');
   const stdout = await run(command, [...prefix, path.join(extracted, 'scripts', 'verify.mjs'), '--output', verificationFile], { cwd: extracted, env, timeoutMs: 600000 });
   report.functional = JSON.parse(await fs.readFile(verificationFile, 'utf8'));
-  if (report.functional.passed === false || report.functional.ok === false) throw new Error('Functional verification reported failure.');
+  if (report.functional.passed !== true) throw new Error('Functional verification did not explicitly report passed=true.');
   report.functionalStdout = stdout.trim();
+  const launcherStdout = process.platform === 'darwin'
+    ? await run('/usr/bin/sandbox-exec', ['-p', '(version 1) (allow default) (deny network*)', '/bin/sh', path.join(extracted, 'rag.sh'), 'doctor'], { cwd: extracted, env, timeoutMs: 120000 })
+    : await run(system('cmd.exe'), ['/d', '/c', 'call .\\rag.cmd doctor'], { cwd: extracted, env, timeoutMs: 120000 });
+  report.launcher = JSON.parse(launcherStdout.trim());
+  if (report.launcher.ready !== true || report.launcher.node !== manifest.nodeVersion) throw new Error('Bundled launcher did not report ready=true with the pinned runtime.');
   // Prove native dependencies load under the same isolation and record DLL origins.
   const nativeProbe = `await import('@huggingface/transformers');await import('onnxruntime-node');console.log(JSON.stringify({sharedObjects:process.report.getReport().sharedObjects}));`;
   const native = JSON.parse((await run(command, [...prefix, '--input-type=module', '-e', nativeProbe], { cwd: extracted, env })).trim());
   report.loadedSharedObjects = native.sharedObjects;
   if (process.platform === 'win32') {
-    const runtimePrefix = path.join(extracted, 'runtime').toLowerCase();
+    const runtimePrefix = normalizeWindowsPath(path.join(extracted, 'runtime'));
     const crt = native.sharedObjects.filter((filename) => /(?:vcruntime140.*|msvcp140.*|concrt140)\.dll$/i.test(filename));
     report.loadedMicrosoftCrt = crt;
-    if (crt.length === 0 || crt.some((filename) => !filename.toLowerCase().startsWith(runtimePrefix + path.sep))) throw new Error('Microsoft CRT was not proven to load entirely from the bundled runtime directory.');
+    if (crt.length === 0 || crt.some((filename) => !normalizeWindowsPath(filename).startsWith(runtimePrefix + '\\'))) throw new Error('Microsoft CRT was not proven to load entirely from the bundled runtime directory.');
   }
   report.passed = true;
 } catch (error) {
@@ -116,6 +121,12 @@ function safeChild(directory, relative) {
   return result;
 }
 function system(binary) { return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', binary); }
+function normalizeWindowsPath(filename) {
+  let result = String(filename);
+  if (result.startsWith('\\\\?\\') || result.startsWith('\\??\\')) result = result.slice(4);
+  if (result.startsWith('UNC\\')) result = '\\\\' + result.slice(4);
+  return path.win32.normalize(result).toLowerCase();
+}
 async function sha256(file) {
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(file)) hash.update(chunk);
