@@ -35,7 +35,7 @@ node scripts/verify-bundle.mjs --archive dist/offline-embeddings-cpu-1.0.0-win32
 
 The verifier extracts into a new path containing spaces, uses only the bundled Node executable, supplies empty external caches and a restricted PATH, applies OS-level network denial, and tests the extracted package. It must also establish that an attempted network connection fails. A missing or ineffective network-denial mechanism is a verification failure, not a silently skipped check.
 
-The report records the archive hash, platform/architecture, Node version, test results, and timing/memory measurements. These timings describe that runner, not the user's corporate laptop. The release workflow waits for both target jobs to pass before publishing assets.
+The report records the archive hash, platform/architecture, Node version, test results, and timing/memory measurements. On Windows it also verifies each loaded Microsoft CRT DLL against the bundle manifest's approved file location and SHA-256, rejecting accidental reliance on a preinstalled system copy. These timings describe that runner, not the user's corporate laptop. The release workflow waits for both target jobs to pass before publishing assets.
 
 ## Destination check
 
