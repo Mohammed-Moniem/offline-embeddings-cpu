@@ -21,7 +21,8 @@ try {
   else throw new Error('Extracted acceptance is supported on macOS and Windows targets.');
   const roots = (await fs.readdir(workspace, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name !== '__MACOSX');
   if (roots.length !== 1) throw new Error('Archive must contain exactly one package directory.');
-  const extracted = path.join(workspace, roots[0].name);
+  const extracted = await fs.realpath(path.join(workspace, roots[0].name));
+  report.packageDirectory = extracted;
   const manifest = JSON.parse(await fs.readFile(path.join(extracted, 'BUNDLE-MANIFEST.json'), 'utf8'));
   if (manifest.platform !== process.platform || manifest.arch !== process.arch) throw new Error('Archive target does not match current host.');
   for (const file of manifest.files) {
@@ -89,10 +90,25 @@ try {
   const native = JSON.parse((await run(command, [...prefix, '--input-type=module', '-e', nativeProbe], { cwd: extracted, env })).trim());
   report.loadedSharedObjects = native.sharedObjects;
   if (process.platform === 'win32') {
-    const runtimePrefix = normalizeWindowsPath(path.join(extracted, 'runtime'));
     const crt = native.sharedObjects.filter((filename) => /(?:vcruntime140.*|msvcp140.*|concrt140)\.dll$/i.test(filename));
     report.loadedMicrosoftCrt = crt;
-    if (crt.length === 0 || crt.some((filename) => !normalizeWindowsPath(filename).startsWith(runtimePrefix + '\\'))) throw new Error('Microsoft CRT was not proven to load entirely from the bundled runtime directory.');
+    if (!crt.length || !Array.isArray(manifest.windowsCrt?.copies) || !manifest.windowsCrt.copies.length) throw new Error('Microsoft CRT deployment or loaded-library evidence is missing.');
+    const allowedCopies = new Map();
+    const declaredFiles = new Map(manifest.files.map((file) => [file.path, file.sha256]));
+    for (const copy of manifest.windowsCrt.copies) {
+      const packagedPath = await fs.realpath(safeChild(extracted, copy.path));
+      if (declaredFiles.get(copy.path) !== copy.sha256 || await sha256(packagedPath) !== copy.sha256) throw new Error(`Microsoft CRT manifest checksum mismatch: ${copy.path}`);
+      allowedCopies.set(normalizeWindowsPath(packagedPath), copy);
+    }
+    report.microsoftCrtVerification = [];
+    for (const loadedPath of crt) {
+      const canonicalPath = await fs.realpath(loadedPath);
+      const copy = allowedCopies.get(normalizeWindowsPath(canonicalPath));
+      if (!copy) throw new Error(`Microsoft CRT loaded outside explicitly packaged locations: ${loadedPath}`);
+      const loadedSha256 = await sha256(canonicalPath);
+      if (loadedSha256 !== copy.sha256) throw new Error(`Loaded Microsoft CRT checksum mismatch: ${loadedPath}`);
+      report.microsoftCrtVerification.push({ loadedPath: canonicalPath, packagedPath: copy.path, sha256: loadedSha256 });
+    }
   }
   report.passed = true;
 } catch (error) {

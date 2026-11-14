@@ -133,10 +133,14 @@ try {
     assert.deepEqual(engine.chunk(' \t\r\n '), []);
     assert.deepEqual(await engine.embedDocuments([]), []);
     const unicode = '  👩🏽‍💻 Café: العربية 日本語.\nBusiness travel expenses and receipts. '.repeat(45);
-    const unbroken = 'abcdefghij'.repeat(1100);
+    const unbroken = 'abcdefghij'.repeat(2000);
     for (const text of [unicode, unbroken]) {
       const chunks = engine.chunk(text, { maxTokens: 384, overlapTokens: 48 });
       assert.ok(chunks.length > 0);
+      if (text === unbroken) {
+        assert.ok(chunks.length <= 4, `Huge unknown word produced ${chunks.length} overlapping chunks instead of at most four`);
+        report.unbrokenDocument = { characters: text.length, chunks: chunks.length };
+      }
       verifyChunkCoverage(text, chunks);
     }
     await assert.rejects(engine.embedQuery('reimbursement '.repeat(600)), /512|token|limit/i);

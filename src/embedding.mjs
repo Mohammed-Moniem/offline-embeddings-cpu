@@ -63,7 +63,7 @@ export class EmbeddingEngine {
       model: MODEL_ID, revision: MODEL_REVISION, dtype: 'q8', dimensions: DIMENSIONS,
       pooling: 'cls', normalize: true, queryPrefix: QUERY_PREFIX,
       weightsSha256: manifest.files.find(file => file.path === 'onnx/model_quantized.onnx').sha256,
-      chunking: { version: 1, maxTokens: 384, overlapTokens: 48 },
+      chunking: { version: 2, maxTokens: 384, overlapTokens: 48 },
     };
     return engine;
   }
@@ -98,13 +98,19 @@ export class EmbeddingEngine {
         }
       }
       const content = slice(start, end);
-      if (content.trim()) chunks.push({ text: content, start: offsets[start], end: offsets[end], tokens: this.tokenCount(content) });
+      const chunkTokens = this.tokenCount(content);
+      if (content.trim()) chunks.push({ text: content, start: offsets[start], end: offsets[end], tokens: chunkTokens });
       if (end === points.length) break;
       let next = end;
-      low = start + 1; high = end - 1;
-      while (low <= high) {
+      // WordPiece may map a very long word to a single [UNK] token. A fixed
+      // token-overlap budget would then retain almost the whole character
+      // window and advance one character per chunk. Bound both token and
+      // character overlap so chunking always makes substantial progress.
+      const effectiveOverlap = Math.min(overlapTokens, Math.max(0, Math.floor((chunkTokens - 2) / 2)));
+      low = start + Math.ceil((end - start) / 2); high = end - 1;
+      while (effectiveOverlap > 0 && low <= high) {
         const mid = Math.floor((low + high) / 2);
-        if (this.tokenCount(slice(mid, end)) <= overlapTokens + 2) { next = mid; high = mid - 1; }
+        if (this.tokenCount(slice(mid, end)) <= effectiveOverlap + 2) { next = mid; high = mid - 1; }
         else low = mid + 1;
       }
       start = Math.max(start + 1, next);

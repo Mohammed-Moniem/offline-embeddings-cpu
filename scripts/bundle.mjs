@@ -111,17 +111,36 @@ if (process.platform === 'win32') {
   for (const required of ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'concrt140.dll']) {
     if (!dlls.some((name) => name.toLowerCase() === required)) throw new Error(`Official CRT directory is missing ${required}`);
   }
+  // Node loads addons with DLL_LOAD_DIR | SYSTEM32. Runtime DLLs beside node.exe
+  // alone are insufficient: dependency resolution must also find the CRT beside
+  // each ONNX/sharp addon and its supporting native DLLs.
+  const onnxNativeDirs = await nativeLibraryDirectories(path.join(stage, 'node_modules', 'onnxruntime-node'));
+  const sharpNativeDirs = [
+    ...await nativeLibraryDirectories(path.join(stage, 'node_modules', '@img')),
+    ...await nativeLibraryDirectories(path.join(stage, 'node_modules', 'sharp')),
+  ];
+  if (!onnxNativeDirs.length || !sharpNativeDirs.length) throw new Error('ONNX and sharp native library directories must both be present for app-local CRT deployment.');
+  const destinations = [...new Set([runtimeDir, ...onnxNativeDirs, ...sharpNativeDirs])].sort();
+  const copies = [];
   for (const dll of dlls) {
     const source = path.join(crtDir, dll);
     const escaped = source.replaceAll("'", "''");
     await run(powershell(), ['-NoProfile', '-NonInteractive', '-Command', `$s=Get-AuthenticodeSignature -LiteralPath '${escaped}'; if($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch 'Microsoft'){exit 1}`]);
-    await fs.copyFile(source, path.join(runtimeDir, dll));
+    const expectedSha256 = await sha256(source);
+    for (const destination of destinations) {
+      const targetFile = path.join(destination, dll);
+      await fs.copyFile(source, targetFile);
+      if (await sha256(targetFile) !== expectedSha256) throw new Error(`Microsoft CRT copy checksum mismatch: ${targetFile}`);
+      copies.push({ path: path.relative(stage, targetFile).split(path.sep).join('/'), sha256: expectedSha256 });
+    }
   }
   windowsCrt = {
-    deployment: 'app-local',
+    deployment: 'app-local-executable-and-native-addon-directories',
     provenance: 'Microsoft Visual Studio x64 Microsoft.VC143.CRT redistributable; every source DLL verified with Authenticode',
     documentation: 'https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files',
     dlls,
+    destinations: destinations.map((directory) => path.relative(stage, directory).split(path.sep).join('/')),
+    copies,
   };
   await fs.writeFile(path.join(runtimeDir, 'MICROSOFT-CRT-NOTICE.txt'), `Microsoft Visual C++ runtime DLLs\nCopyright Microsoft Corporation. All rights reserved.\nThese signed redistributable runtime DLLs are deployed app-locally from the Microsoft Visual Studio x64 Microsoft.VC143.CRT redistributable directory.\nRedistribution and license terms: https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution\nDeployment documentation: ${windowsCrt.documentation}\n`);
 }
@@ -198,6 +217,17 @@ async function fileManifest(directory, prefix = '') {
     else throw new Error(`Unexpected non-file in bundle: ${relative}`);
   }
   return items;
+}
+async function nativeLibraryDirectories(directory) {
+  const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error) => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  const result = entries.some((entry) => entry.isFile() && /\.(node|dll)$/i.test(entry.name)) ? [directory] : [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) result.push(...await nativeLibraryDirectories(path.join(directory, entry.name)));
+  }
+  return result;
 }
 function run(command, args) {
   return new Promise((resolve, reject) => {
