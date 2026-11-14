@@ -1,0 +1,21 @@
+{
+  "name": "offline-embeddings-cpu",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline CPU text embeddings and SQLite hybrid retrieval for Node.js harnesses",
+  "license": "MIT",
+  "engines": { "node": ">=24.11.0 <25" },
+  "exports": "./src/index.mjs",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "verify": "node scripts/verify.mjs",
+    "fetch:model": "node scripts/fetch-model.mjs",
+    "bundle": "node scripts/bundle.mjs",
+    "demo": "node src/cli.mjs demo"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.2",
+    "sqlite-vec": "0.1.9"
+  }
+}

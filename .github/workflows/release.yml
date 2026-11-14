@@ -1,0 +1,129 @@
+name: Verify and package offline embeddings
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-embeddings-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Verify ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: win32-x64
+            firewall: --firewall
+          - runner: macos-15
+            platform: darwin-arm64
+            firewall: ''
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.18.0'
+          cache: npm
+      - name: Assert target architecture
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          actual="$(node -p 'process.platform + "-" + process.arch')"
+          test "$actual" = "$EXPECTED_PLATFORM"
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Audit resolved dependency policy
+        run: node scripts/audit-dependencies.mjs
+      - name: Unit tests
+        run: npm test
+      - name: Fetch and verify pinned local model
+        run: npm run fetch:model
+      - name: Real model and retrieval verification
+        run: node scripts/verify.mjs --output dist/source-verification-${{ matrix.platform }}.json
+      - name: Locate redistributable Windows CRT
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installations = & $vswhere -all -products '*' -property installationPath
+          $candidates = foreach ($installation in $installations) {
+            $redist = Join-Path $installation 'VC\Redist\MSVC'
+            if (Test-Path $redist) {
+              Get-ChildItem -Path $redist -Directory -Recurse -Filter 'Microsoft.VC*.CRT' |
+                Where-Object { $_.Parent.Name -eq 'x64' }
+            }
+          }
+          $crt = $candidates | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw 'No official Visual Studio x64 CRT redistribution directory found.' }
+          "WINDOWS_CRT_DIR=$($crt.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Package macOS runtime and all assets
+        if: runner.os == 'macOS'
+        run: node scripts/bundle.mjs --output dist
+      - name: Package Windows runtime and all assets
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: node scripts/bundle.mjs --output dist --windows-crt-dir "$env:WINDOWS_CRT_DIR"
+      - name: Verify exact extracted archive with network denied
+        run: >-
+          node scripts/verify-bundle.mjs
+          --archive dist/offline-embeddings-cpu-1.0.0-${{ matrix.platform }}.zip
+          --output dist/verification-${{ matrix.platform }}.json
+          ${{ matrix.firewall }}
+      - name: Upload verified package and evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/*verification*.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish verified release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Publish after both target packages passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/offline-embeddings-cpu-1.0.0-win32-x64.zip
+          test -f dist/offline-embeddings-cpu-1.0.0-darwin-arm64.zip
+          test -f dist/verification-win32-x64.json
+          test -f dist/verification-darwin-arm64.json
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes-file docs/RELEASE-NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

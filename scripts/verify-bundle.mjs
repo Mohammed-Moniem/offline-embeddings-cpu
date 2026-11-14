@@ -1,0 +1,134 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import * as fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+
+const options = parseArgs(process.argv.slice(2));
+if (!options.archive) throw new Error('Usage: node scripts/verify-bundle.mjs --archive FILE.zip [--output REPORT.json] [--firewall]');
+const archive = path.resolve(options.archive);
+const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'offline embeddings extracted '));
+const report = { schemaVersion: 1, startedAt: new Date().toISOString(), archive, platform: process.platform, arch: process.arch, extractedTo: workspace, passed: false };
+const output = options.output ? path.resolve(options.output) : null;
+let firewallRule = null;
+try {
+  const expected = (await fs.readFile(`${archive}.sha256`, 'utf8')).trim().split(/\s+/)[0];
+  report.archiveSha256 = await sha256(archive);
+  if (!/^[0-9a-f]{64}$/.test(expected) || report.archiveSha256 !== expected) throw new Error('Archive checksum mismatch.');
+  if (process.platform === 'darwin') await run('/usr/bin/ditto', ['-x', '-k', archive, workspace]);
+  else if (process.platform === 'win32') await run(system('tar.exe'), ['-xf', archive, '-C', workspace]);
+  else throw new Error('Extracted acceptance is supported on macOS and Windows targets.');
+  const roots = (await fs.readdir(workspace, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name !== '__MACOSX');
+  if (roots.length !== 1) throw new Error('Archive must contain exactly one package directory.');
+  const extracted = path.join(workspace, roots[0].name);
+  const manifest = JSON.parse(await fs.readFile(path.join(extracted, 'BUNDLE-MANIFEST.json'), 'utf8'));
+  if (manifest.platform !== process.platform || manifest.arch !== process.arch) throw new Error('Archive target does not match current host.');
+  for (const file of manifest.files) {
+    const absolute = safeChild(extracted, file.path);
+    if ((await fs.stat(absolute)).size !== file.size || await sha256(absolute) !== file.sha256) throw new Error(`Extracted file checksum mismatch: ${file.path}`);
+  }
+  report.verifiedFiles = manifest.files.length;
+  const node = path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
+  const emptyPath = path.join(workspace, 'empty executable path');
+  const userHome = path.join(workspace, 'fresh user home');
+  const data = path.join(workspace, 'fresh data');
+  await Promise.all([emptyPath, userHome, data].map((directory) => fs.mkdir(directory, { recursive: true })));
+  const env = {
+    PATH: emptyPath,
+    HOME: userHome,
+    USERPROFILE: userHome,
+    APPDATA: path.join(userHome, 'AppData', 'Roaming'),
+    LOCALAPPDATA: path.join(userHome, 'AppData', 'Local'),
+    TMPDIR: workspace,
+    TMP: workspace,
+    TEMP: workspace,
+    OFFLINE_EMBEDDINGS_DATA: data,
+    HF_HUB_OFFLINE: '1',
+    TRANSFORMERS_OFFLINE: '1',
+    LANG: 'en_US.UTF-8',
+    ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot || 'C:\\Windows', WINDIR: process.env.WINDIR || 'C:\\Windows' } : {}),
+  };
+  let command = node;
+  let prefix = [];
+  if (process.platform === 'darwin') {
+    command = '/usr/bin/sandbox-exec';
+    prefix = ['-p', '(version 1) (allow default) (deny network*)', node];
+    report.networkIsolation = 'macOS sandbox-exec deny network*';
+  } else {
+    if (!options.firewall) throw new Error('Windows acceptance requires --firewall on an elevated test runner to prove OS-level network denial. Normal package use does not require administrator access.');
+    firewallRule = `OfflineEmbeddingsAcceptance-${randomUUID()}`;
+    await run(system('netsh.exe'), ['advfirewall', 'firewall', 'add', 'rule', `name=${firewallRule}`, 'dir=out', 'action=block', `program=${node}`, 'enable=yes', 'profile=any']);
+    report.networkIsolation = 'Windows Defender Firewall per-program outbound block';
+    const rule = await run(system('netsh.exe'), ['advfirewall', 'firewall', 'show', 'rule', `name=${firewallRule}`, 'verbose']);
+    if (!rule.includes(firewallRule) || !rule.toLowerCase().includes(node.toLowerCase())) throw new Error('Could not confirm Windows network-denial rule.');
+  }
+  // Verify denied native socket access, independently of Transformers' offline flags.
+  const probe = `const net=await import('node:net');const s=net.connect({host:'1.1.1.1',port:443});const timer=setTimeout(()=>{s.destroy();console.log('NETWORK_DENIED:timeout')},3000);s.on('connect',()=>{clearTimeout(timer);s.destroy();console.error('NETWORK_UNEXPECTEDLY_ALLOWED');process.exitCode=3});s.on('error',e=>{clearTimeout(timer);console.log('NETWORK_DENIED:'+e.code)});`;
+  report.networkProbe = (await run(command, [...prefix, '--input-type=module', '-e', probe], { cwd: extracted, env })).trim();
+  if (!report.networkProbe.startsWith('NETWORK_DENIED:')) throw new Error('Network-denial probe did not confirm denial.');
+  report.nodeVersion = (await run(command, [...prefix, '--version'], { cwd: extracted, env })).trim();
+  if (report.nodeVersion !== manifest.nodeVersion) throw new Error('Runtime version differs from manifest.');
+  const verificationFile = path.join(workspace, 'functional verification.json');
+  const stdout = await run(command, [...prefix, path.join(extracted, 'scripts', 'verify.mjs'), '--output', verificationFile], { cwd: extracted, env, timeoutMs: 600000 });
+  report.functional = JSON.parse(await fs.readFile(verificationFile, 'utf8'));
+  if (report.functional.passed === false || report.functional.ok === false) throw new Error('Functional verification reported failure.');
+  report.functionalStdout = stdout.trim();
+  // Prove native dependencies load under the same isolation and record DLL origins.
+  const nativeProbe = `await import('@huggingface/transformers');await import('onnxruntime-node');console.log(JSON.stringify({sharedObjects:process.report.getReport().sharedObjects}));`;
+  const native = JSON.parse((await run(command, [...prefix, '--input-type=module', '-e', nativeProbe], { cwd: extracted, env })).trim());
+  report.loadedSharedObjects = native.sharedObjects;
+  if (process.platform === 'win32') {
+    const runtimePrefix = path.join(extracted, 'runtime').toLowerCase();
+    const crt = native.sharedObjects.filter((filename) => /(?:vcruntime140.*|msvcp140.*|concrt140)\.dll$/i.test(filename));
+    report.loadedMicrosoftCrt = crt;
+    if (crt.length === 0 || crt.some((filename) => !filename.toLowerCase().startsWith(runtimePrefix + path.sep))) throw new Error('Microsoft CRT was not proven to load entirely from the bundled runtime directory.');
+  }
+  report.passed = true;
+} catch (error) {
+  report.error = error.stack || String(error);
+  process.exitCode = 1;
+} finally {
+  if (firewallRule) {
+    try { await run(system('netsh.exe'), ['advfirewall', 'firewall', 'delete', 'rule', `name=${firewallRule}`]); }
+    catch (error) { report.firewallCleanupError = String(error); report.passed = false; process.exitCode = 1; }
+  }
+  report.finishedAt = new Date().toISOString();
+  if (output) {
+    await fs.mkdir(path.dirname(output), { recursive: true });
+    await fs.writeFile(output, JSON.stringify(report, null, 2) + '\n');
+  }
+  console.log(JSON.stringify(report, null, 2));
+}
+
+function parseArgs(args) {
+  const result = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--firewall') result.firewall = true;
+    else if (['--archive', '--output'].includes(args[i]) && args[i + 1]) result[args[i].slice(2)] = args[++i];
+    else throw new Error(`Unknown or incomplete argument: ${args[i]}`);
+  }
+  return result;
+}
+function safeChild(directory, relative) {
+  const result = path.resolve(directory, relative);
+  if (!result.startsWith(directory + path.sep)) throw new Error(`Unsafe manifest path ${relative}`);
+  return result;
+}
+function system(binary) { return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', binary); }
+async function sha256(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: options.cwd, env: options.env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`${command} timed out`)); }, options.timeoutMs || 120000);
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', (error) => { clearTimeout(timer); reject(error); });
+    child.once('exit', (code) => { clearTimeout(timer); code === 0 ? resolve(stdout) : reject(new Error(`${command} exited ${code}: ${stderr || stdout}`)); });
+  });
+}
