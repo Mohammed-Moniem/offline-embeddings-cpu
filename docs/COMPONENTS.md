@@ -20,6 +20,8 @@ The model's quantized ONNX file has SHA-256:
 
 It is 34,014,426 bytes. That is the weight file's size, not the complete package size or runtime memory requirement. Tokenizer/config assets and the native runtime are also included. The model manifest records source revision and hashes for the actual shipped files.
 
+The full original permissive license notice is included as [BGE-MODEL-LICENSE.txt](BGE-MODEL-LICENSE.txt), copied from the official [FlagEmbedding LICENSE](https://github.com/FlagOpen/FlagEmbedding/blob/master/LICENSE) (Copyright 2022 staoxiao). The [original BGE model card](https://huggingface.co/BAAI/bge-small-en-v1.5) declares the model's MIT license; the pinned Xenova conversion links back to that model. This notice is separate from the application source license.
+
 `package-lock.json` records the full JavaScript dependency closure and integrity identifiers. Dependency packages retain their own license files and notices in `node_modules`. Node's own license contains its bundled third-party notices. The per-archive manifest identifies the actual runtime and files included for that platform.
 
 Windows CRT files come from the official Visual Studio redistribution directory on the Windows build runner and are placed next to the bundled executable. [Microsoft documents application-local redistribution](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files) subject to the Visual Studio license terms. Their license is not replaced by this project's MIT license. The package must be rebuilt when these app-local DLLs need servicing.

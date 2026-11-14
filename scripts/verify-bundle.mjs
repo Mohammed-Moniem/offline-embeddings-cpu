@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,7 +29,7 @@ try {
     if ((await fs.stat(absolute)).size !== file.size || await sha256(absolute) !== file.sha256) throw new Error(`Extracted file checksum mismatch: ${file.path}`);
   }
   report.verifiedFiles = manifest.files.length;
-  const node = path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
+  const node = await fs.realpath(path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node'));
   const emptyPath = path.join(workspace, 'empty executable path');
   const userHome = path.join(workspace, 'fresh user home');
   const data = path.join(workspace, 'fresh data');
@@ -58,10 +58,15 @@ try {
   } else {
     if (!options.firewall) throw new Error('Windows acceptance requires --firewall on an elevated test runner to prove OS-level network denial. Normal package use does not require administrator access.');
     firewallRule = `OfflineEmbeddingsAcceptance-${randomUUID()}`;
-    await run(system('netsh.exe'), ['advfirewall', 'firewall', 'add', 'rule', `name=${firewallRule}`, 'dir=out', 'action=block', `program=${node}`, 'enable=yes', 'profile=any']);
+    await run(powershell(), ['-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference='Stop'; New-NetFirewallRule -Name ${psLiteral(firewallRule)} -DisplayName ${psLiteral(firewallRule)} -Direction Outbound -Action Block -Program ${psLiteral(node)} -Enabled True -Profile Any | Out-Null`]);
     report.networkIsolation = 'Windows Defender Firewall per-program outbound block';
-    const rule = await run(system('netsh.exe'), ['advfirewall', 'firewall', 'show', 'rule', `name=${firewallRule}`, 'verbose']);
-    if (!rule.includes(firewallRule) || !rule.toLowerCase().includes(node.toLowerCase())) throw new Error('Could not confirm Windows network-denial rule.');
+    const rule = JSON.parse((await run(powershell(), ['-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference='Stop'; $r=Get-NetFirewallRule -Name ${psLiteral(firewallRule)}; $a=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{Name=$r.Name;Enabled=$r.Enabled.ToString();Direction=$r.Direction.ToString();Action=$r.Action.ToString();Program=$a.Program} | ConvertTo-Json -Compress`])).trim());
+    if (rule.Name !== firewallRule || rule.Enabled !== 'True' || rule.Direction !== 'Outbound' || rule.Action !== 'Block' || normalizeWindowsPath(rule.Program) !== normalizeWindowsPath(node)) {
+      throw new Error('Could not confirm Windows network-denial rule and executable path.');
+    }
+    report.firewallRule = rule;
   }
   // Verify denied native socket access, independently of Transformers' offline flags.
   const probe = `const net=await import('node:net');const s=net.connect({host:'1.1.1.1',port:443});const timer=setTimeout(()=>{s.destroy();console.log('NETWORK_DENIED:timeout')},3000);s.on('connect',()=>{clearTimeout(timer);s.destroy();console.error('NETWORK_UNEXPECTEDLY_ALLOWED');process.exitCode=3});s.on('error',e=>{clearTimeout(timer);console.log('NETWORK_DENIED:'+e.code)});`;
@@ -95,7 +100,8 @@ try {
   process.exitCode = 1;
 } finally {
   if (firewallRule) {
-    try { await run(system('netsh.exe'), ['advfirewall', 'firewall', 'delete', 'rule', `name=${firewallRule}`]); }
+    try { await run(powershell(), ['-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference='Stop'; Get-NetFirewallRule -Name ${psLiteral(firewallRule)} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop; if(Get-NetFirewallRule -Name ${psLiteral(firewallRule)} -ErrorAction SilentlyContinue){throw 'Firewall rule cleanup failed'}`]); }
     catch (error) { report.firewallCleanupError = String(error); report.passed = false; process.exitCode = 1; }
   }
   report.finishedAt = new Date().toISOString();
@@ -121,6 +127,11 @@ function safeChild(directory, relative) {
   return result;
 }
 function system(binary) { return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', binary); }
+function powershell() {
+  const modern = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
+  return existsSync(modern) ? modern : system(path.join('WindowsPowerShell', 'v1.0', 'powershell.exe'));
+}
+function psLiteral(value) { return "'" + String(value).replaceAll("'", "''") + "'"; }
 function normalizeWindowsPath(filename) {
   let result = String(filename);
   if (result.startsWith('\\\\?\\') || result.startsWith('\\??\\')) result = result.slice(4);
@@ -134,7 +145,9 @@ async function sha256(file) {
 }
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: options.cwd, env: options.env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const env = options.env ? { ...options.env } : { ...process.env };
+    if (/(?:powershell|pwsh)\.exe$/i.test(command)) delete env.PSModulePath;
+    const child = spawn(command, args, { cwd: options.cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     const timer = setTimeout(() => { child.kill(); reject(new Error(`${command} timed out`)); }, options.timeoutMs || 120000);
     child.stdout.on('data', (chunk) => { stdout += chunk; });
